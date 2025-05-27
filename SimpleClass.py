@@ -2,151 +2,123 @@ package com.rbs.bdd.application.service;
 
 import com.rbs.bdd.application.exception.AccountValidationException;
 import com.rbs.bdd.application.exception.SchemaValidationException;
-import com.rbs.bdd.application.port.out.AccountValidationPort;
-import com.rbs.bdd.domain.enums.AccountStatus;
-import com.rbs.bdd.domain.enums.ModulusCheckStatus;
-import com.rbs.bdd.domain.enums.SwitchingStatus;
 import com.rbs.bdd.generated.ValidateArrangementForPaymentRequest;
-import lombok.RequiredArgsConstructor;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.stereotype.Service;
+import jakarta.xml.bind.JAXBContext;
+import jakarta.xml.bind.JAXBElement;
+import jakarta.xml.bind.Unmarshaller;
+import jakarta.xml.soap.MessageFactory;
+import jakarta.xml.soap.SOAPBody;
+import jakarta.xml.soap.SOAPMessage;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.springframework.ws.WebServiceMessage;
 import org.springframework.ws.soap.saaj.SaajSoapMessage;
 import org.w3c.dom.Document;
-import org.w3c.dom.Node;
 
-import javax.xml.XMLConstants;
-import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.transform.Transformer;
-import javax.xml.transform.TransformerFactory;
-import javax.xml.transform.dom.DOMSource;
-import javax.xml.transform.stream.StreamResult;
-import javax.xml.transform.stream.StreamSource;
 import javax.xml.xpath.XPath;
-import javax.xml.xpath.XPathConstants;
-import javax.xml.xpath.XPathExpressionException;
 import javax.xml.xpath.XPathFactory;
+
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
-import java.util.List;
-import java.util.Optional;
-import java.util.UUID;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
-/**
- * Validates SOAP requests and modifies a static response based on identifier + code.
- * If no match is found, throws {@link AccountValidationException}.
- */
-@Service
-@RequiredArgsConstructor
-public class AccountValidationService implements AccountValidationPort {
+import static org.junit.jupiter.api.Assertions.*;
 
-    private static final Logger logger = LoggerFactory.getLogger(AccountValidationService.class);
+class AccountValidationServiceTest {
 
-    private static final String INTL_BANK_ACCOUNT = "InternationalBankAccountNumber";
-    private static final String UK_BASIC_BANK_ACCOUNT = "UKBasicBankAccountNumber";
+    private AccountValidationService accountValidationService;
 
-    private static final List<AccountRule> RULES = List.of(
-            new AccountRule("GB29NWBK60161331926801", AccountStatus.DOMESTIC_RESTRICTED, SwitchingStatus.SWITCHED, ModulusCheckStatus.PASS),
-            new AccountRule("GB82WEST12345698765437", AccountStatus.DOMESTIC_RESTRICTED, SwitchingStatus.NOT_SWITCHING, ModulusCheckStatus.PASS),
-            new AccountRule("GB94BARC10201530093422", AccountStatus.DOMESTIC_UNRESTRICTED, SwitchingStatus.SWITCHED, ModulusCheckStatus.PASS),
-            new AccountRule("GB33BUKB20201555555567", AccountStatus.DOMESTIC_UNRESTRICTED, SwitchingStatus.NOT_SWITCHING, ModulusCheckStatus.FAILED)
-    );
-
-    @Override
-    public void validateSchema(ValidateArrangementForPaymentRequest request) {
-        logger.info("Schema validation completed (handled by Spring WS interceptor)");
+    @BeforeEach
+    void setup() {
+        accountValidationService = new AccountValidationService();
     }
 
-    @Override
-    public void validateBusinessRules(ValidateArrangementForPaymentRequest request, WebServiceMessage message) {
-        try (InputStream xml = getClass().getClassLoader().getResourceAsStream("static-response/response1.xml")) {
-            if (xml == null) throw new SchemaValidationException("response1.xml not found");
+    private ValidateArrangementForPaymentRequest loadRequest(String identifier, String codeValue) throws Exception {
+        String template = Files.readString(Path.of("src/test/resources/static-request/static-request.xml"));
+        String finalXml = template
+                .replace("${IDENTIFIER}", identifier)
+                .replace("${CODEVALUE}", codeValue);
 
-            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-            factory.setNamespaceAware(true);
-            factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
-            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
-            factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
-            factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
-            factory.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
-            factory.setXIncludeAware(false);
-            factory.setExpandEntityReferences(false);
+        SOAPMessage soapMessage = MessageFactory.newInstance()
+                .createMessage(null, new ByteArrayInputStream(finalXml.getBytes(StandardCharsets.UTF_8)));
+        SOAPBody body = soapMessage.getSOAPBody();
 
-            Document doc = factory.newDocumentBuilder().parse(xml);
-            XPath xpath = XPathFactory.newInstance().newXPath();
+        JAXBContext jaxbContext = JAXBContext.newInstance(ValidateArrangementForPaymentRequest.class);
+        Unmarshaller unmarshaller = jaxbContext.createUnmarshaller();
+        JAXBElement<ValidateArrangementForPaymentRequest> jaxbElement =
+                unmarshaller.unmarshal(body.getElementsByTagNameNS("*", "validateArrangementForPayment").item(0),
+                        ValidateArrangementForPaymentRequest.class);
 
-            RequestParams params = extractRequestDetails(request);
-            ResponseConfig config = determineResponseConfig(params)
-                    .orElseThrow(() -> new AccountValidationException("Account Validation failed: account not found"));
-
-            applyResponse(doc, xpath, config);
-
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            TransformerFactory transformerFactory = TransformerFactory.newInstance();
-            transformerFactory.setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, "");
-            transformerFactory.setAttribute(XMLConstants.ACCESS_EXTERNAL_STYLESHEET, "");
-            Transformer transformer = transformerFactory.newTransformer();
-            transformer.transform(new DOMSource(doc), new StreamResult(out));
-
-            ((SaajSoapMessage) message).getSaajMessage().getSOAPPart()
-                    .setContent(new StreamSource(new ByteArrayInputStream(out.toByteArray())));
-
-        } catch (AccountValidationException e) {
-            logger.error("Business rule not matched: {}", e.getMessage());
-            throw e;
-        } catch (Exception e) {
-            logger.error("Business rule processing failed: {}", e.getMessage(), e);
-            throw new AccountValidationException("Account Validation Failed", e);
-        }
+        return jaxbElement.getValue();
     }
 
-    private RequestParams extractRequestDetails(ValidateArrangementForPaymentRequest request) {
-        String id = request.getArrangementIdentifier().getIdentifier();
-        String code = request.getArrangementIdentifier().getContext().getCodeValue();
-        return new RequestParams(id, code, id != null ? id.length() : 0);
+    private Document invokeServiceAndGetModifiedDoc(ValidateArrangementForPaymentRequest request) throws Exception {
+        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        WebServiceMessage message = new SaajSoapMessage(MessageFactory.newInstance().createMessage());
+        accountValidationService.validateSchema(request);
+        accountValidationService.validateBusinessRules(request, message);
+        message.writeTo(outputStream);
+
+        return DocumentBuilderFactory.newInstance().newDocumentBuilder()
+                .parse(new ByteArrayInputStream(outputStream.toByteArray()));
     }
 
-    private Optional<ResponseConfig> determineResponseConfig(RequestParams p) {
-        return RULES.stream()
-                .filter(rule ->
-                        (p.numberOfDigits() == 22 &&
-                                p.codeValue().equals(INTL_BANK_ACCOUNT) &&
-                                p.identifier().equals(rule.iban()))
-                                ||
-                        (p.numberOfDigits() == 14 &&
-                                p.codeValue().equals(UK_BASIC_BANK_ACCOUNT) &&
-                                p.identifier().equals(extractLast14Digits(rule.iban())))
-                )
-                .findFirst()
-                .map(rule -> new ResponseConfig(rule.status(), rule.switching(), rule.modulus()));
+    private String getXpathValue(Document doc, String expression) throws Exception {
+        XPath xpath = XPathFactory.newInstance().newXPath();
+        return xpath.evaluate(expression, doc);
     }
 
-    private String extractLast14Digits(String iban) {
-        return iban != null && iban.length() >= 14 ? iban.substring(iban.length() - 14) : iban;
+    @Test
+    void testScenario1_Restricted_Switched_Pass() throws Exception {
+        //ValidateArrangementForPaymentRequest req = loadRequest("GB29NWBK60161331926801", "InternationalBankAccountNumber");
+        ValidateArrangementForPaymentRequest req = loadRequest("60161331926801", "UKBasicBankAccountNumber");
+
+        Document doc = invokeServiceAndGetModifiedDoc(req);
+        assertEquals("Domestic - Restricted", getXpathValue(doc, "//*[local-name()='accountingUnits']/*[local-name()='status']/*[local-name()='codeValue']"));
+        assertEquals("Switched", getXpathValue(doc, "//*[local-name()='switchingStatus']/*[local-name()='codeValue']"));
+        assertEquals("Passed", getXpathValue(doc, "//*[local-name()='modulusCheckStatus']/*[local-name()='codeValue']"));
     }
 
-    private void applyResponse(Document doc, XPath xpath, ResponseConfig config) throws XPathExpressionException {
-        set(xpath, doc, "//*[local-name()='transactionId']", generateTransactionId());
-        set(xpath, doc, "//*[local-name()='accountingUnits']/*[local-name()='status']/*[local-name()='codeValue']", config.status().getValue());
-        set(xpath, doc, "//*[local-name()='switchingStatus']/*[local-name()='codeValue']", config.switching().getValue());
-        set(xpath, doc, "//*[local-name()='modulusCheckStatus']/*[local-name()='codeValue']", config.modulus().getValue());
+    @Test
+    void testScenario2_Restricted_NotSwitching_Pass() throws Exception {
+      //  ValidateArrangementForPaymentRequest req = loadRequest("GB82WEST12345698765437", "InternationalBankAccountNumber");
+        ValidateArrangementForPaymentRequest req = loadRequest("12345698765437", "UKBasicBankAccountNumber");
+        Document doc = invokeServiceAndGetModifiedDoc(req);
+        assertEquals("Domestic - Restricted", getXpathValue(doc, "//*[local-name()='accountingUnits']/*[local-name()='status']/*[local-name()='codeValue']"));
+        assertEquals("Not Switching", getXpathValue(doc, "//*[local-name()='switchingStatus']/*[local-name()='codeValue']"));
+        assertEquals("Passed", getXpathValue(doc, "//*[local-name()='modulusCheckStatus']/*[local-name()='codeValue']"));
     }
 
-    private void set(XPath xpath, Document doc, String expr, String value) throws XPathExpressionException {
-        Node node = (Node) xpath.evaluate(expr, doc, XPathConstants.NODE);
-        if (node != null) node.setTextContent(value);
+    @Test
+    void testScenario3_Unrestricted_Switched_Pass() throws Exception {
+       // ValidateArrangementForPaymentRequest req = loadRequest("GB94BARC10201530093422", "InternationalBankAccountNumber");
+        ValidateArrangementForPaymentRequest req = loadRequest("10201530093422", "UKBasicBankAccountNumber");
+        Document doc = invokeServiceAndGetModifiedDoc(req);
+        assertEquals("Domestic - Unrestricted", getXpathValue(doc, "//*[local-name()='accountingUnits']/*[local-name()='status']/*[local-name()='codeValue']"));
+        assertEquals("Switched", getXpathValue(doc, "//*[local-name()='switchingStatus']/*[local-name()='codeValue']"));
+        assertEquals("Passed", getXpathValue(doc, "//*[local-name()='modulusCheckStatus']/*[local-name()='codeValue']"));
     }
 
-    private String generateTransactionId() {
-        return "3flS" + UUID.randomUUID().toString().replace("-", "") + "h";
+    @Test
+    void testScenario4_Unrestricted_NotSwitching_Failed() throws Exception {
+        ValidateArrangementForPaymentRequest req = loadRequest("GB33BUKB20201555555567", "InternationalBankAccountNumber");
+       // ValidateArrangementForPaymentRequest req = loadRequest("20201555555567", "UKBasicBankAccountNumber");
+        Document doc = invokeServiceAndGetModifiedDoc(req);
+        assertEquals("Domestic - Unrestricted", getXpathValue(doc, "//*[local-name()='accountingUnits']/*[local-name()='status']/*[local-name()='codeValue']"));
+        assertEquals("Not Switching", getXpathValue(doc, "//*[local-name()='switchingStatus']/*[local-name()='codeValue']"));
+        assertEquals("Failed", getXpathValue(doc, "//*[local-name()='modulusCheckStatus']/*[local-name()='codeValue']"));
     }
 
-    private record RequestParams(String identifier, String codeValue, int numberOfDigits) {}
+    @Test
+    void testNoMatchingScenario_shouldThrowException() throws Exception {
+        ValidateArrangementForPaymentRequest req = loadRequest("GB00XXXX00000000000000", "InternationalBankAccountNumber");
+        WebServiceMessage message = new SaajSoapMessage(MessageFactory.newInstance().createMessage());
 
-    private record ResponseConfig(AccountStatus status, SwitchingStatus switching, ModulusCheckStatus modulus) {}
-
-    private record AccountRule(String iban, AccountStatus status, SwitchingStatus switching, ModulusCheckStatus modulus) {}
+        Exception exception = assertThrows(AccountValidationException.class, () ->
+                accountValidationService.validateBusinessRules(req, message));
+        assertTrue(exception.getMessage().contains("Account Validation failed: account not found"));
+    }
 }
