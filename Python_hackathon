@@ -1,0 +1,169 @@
+package com.rbs.bdd.application.service;
+
+
+import com.rbs.bdd.application.exception.AccountValidationException;
+import com.rbs.bdd.application.exception.SchemaValidationException;
+import com.rbs.bdd.application.port.out.AccountValidationPort;
+import com.rbs.bdd.domain.enums.AccountStatus;
+import com.rbs.bdd.domain.enums.ModulusCheckStatus;
+import com.rbs.bdd.domain.enums.SwitchingStatus;
+import com.rbs.bdd.generated.*;
+import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+import org.springframework.ws.WebServiceMessage;
+import org.springframework.ws.soap.saaj.SaajSoapMessage;
+import org.w3c.dom.Document;
+import org.w3c.dom.Node;
+import org.xml.sax.SAXException;
+
+import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.parsers.ParserConfigurationException;
+import javax.xml.transform.Transformer;
+import javax.xml.transform.TransformerFactory;
+import javax.xml.transform.dom.DOMSource;
+import javax.xml.transform.stream.StreamResult;
+import javax.xml.transform.stream.StreamSource;
+import javax.xml.xpath.XPath;
+import javax.xml.xpath.XPathConstants;
+import javax.xml.xpath.XPathExpressionException;
+import javax.xml.xpath.XPathFactory;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.lang.Exception;
+import java.util.UUID;
+import java.util.Optional;
+
+
+/**
+ * Service class responsible for validating SOAP schema and applying business rules
+ * based on identifier and code value in the incoming SOAP request.
+ * This class reads a static SOAP response XML template, modifies specific fields
+ * based on matched scenarios, and returns the updated SOAP message.
+ */
+@Service
+@RequiredArgsConstructor
+public class AccountValidationService implements AccountValidationPort {
+
+    private static final Logger logger = LoggerFactory.getLogger(AccountValidationService.class);
+
+    @Override
+    public void validateSchema(ValidateArrangementForPaymentRequest request) {
+        logger.info("Schema validation completed (handled by Spring WS interceptor)");
+    }
+
+    @Override
+    public void validateBusinessRules(ValidateArrangementForPaymentRequest request, WebServiceMessage message) {
+        try {
+            InputStream xml = getClass().getClassLoader().getResourceAsStream("static-response/response1.xml");
+            if (xml == null) throw new SchemaValidationException("response1.xml not found");
+
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+            factory.setNamespaceAware(true);
+            factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+            DocumentBuilder builder = factory.newDocumentBuilder();
+            Document doc = builder.parse(xml);
+            XPath xpath = XPathFactory.newInstance().newXPath();
+
+            RequestParams params = extractRequestDetails(request);
+            ResponseConfig config= determineResponseConfig(params)
+                    .orElseThrow(()->new AccountValidationException("Account Validation failed :account not found"));
+            applyResponse(doc, xpath, config);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            Transformer transformer = TransformerFactory.newInstance().newTransformer();
+            transformer.transform(new DOMSource(doc), new StreamResult(out));
+            ((SaajSoapMessage) message).getSaajMessage().getSOAPPart()
+                    .setContent(new StreamSource(new ByteArrayInputStream(out.toByteArray())));
+
+        }
+        catch (AccountValidationException e) {
+            logger.error("Error in AccountValidationException: {}", e.getMessage(), e);
+            throw new AccountValidationException("Account Validation failed :account not found", e);
+        }
+        catch (Exception e) {
+            logger.error("Error in validateBusinessRules: {}", e.getMessage(), e);
+            throw new AccountValidationException("Business rule processing failed", e);
+        }
+    }
+
+    private RequestParams extractRequestDetails(ValidateArrangementForPaymentRequest request) {
+        String identifier = request.getArrangementIdentifier().getIdentifier();
+        String codeValue = request.getArrangementIdentifier().getContext().getCodeValue();
+        int length = identifier != null ? identifier.length() : 0;
+        return new RequestParams(identifier, codeValue, length);
+    }
+
+    private Optional<ResponseConfig> determineResponseConfig(RequestParams p) {
+        String id = p.identifier();
+        int len = p.numberOfDigits();
+        String code = p.codeValue();
+        String ibanAccount1="GB29NWBK60161331926801";
+        String ibanAccount2="GB82WEST12345698765437";
+        String ibanAccount3="GB94BARC10201530093422";
+        String ibanAccount4="GB33BUKB20201555555567";
+        String account1=extractLast14Digits(ibanAccount1);
+        String account2=extractLast14Digits(ibanAccount2);
+        String account3=extractLast14Digits(ibanAccount3);
+        String account4=extractLast14Digits(ibanAccount4);
+        logger.info("Account 1 :"+account1);
+        logger.info("Account 2 :"+account2);
+        logger.info("Account 3 :"+account3);
+        logger.info("Account 4 :"+account4);
+        if ((len == 22 && code.equals("InternationalBankAccountNumber") && id.equals(ibanAccount1))
+                || (len == 14 && code.equals("UKBasicBankAccountNumber") && id.equals(account1))) {
+            logger.info("Account is Domestic-Restricted , Switched and modulus is passed");
+            return Optional.of(new ResponseConfig(AccountStatus.DOMESTIC_RESTRICTED, SwitchingStatus.SWITCHED, ModulusCheckStatus.PASS));
+        } else if ((len == 22 && code.equals("InternationalBankAccountNumber") && id.equals(ibanAccount2))
+                || (len == 14 && code.equals("UKBasicBankAccountNumber") && id.equals(account2))) {
+            logger.info("Account is Domestic-Restricted , NotSwitching and modulus is passed");
+            return Optional.of(new ResponseConfig(AccountStatus.DOMESTIC_RESTRICTED, SwitchingStatus.NOT_SWITCHING, ModulusCheckStatus.PASS));
+        } else if ((len == 22 && code.equals("InternationalBankAccountNumber") && id.equals(ibanAccount3))
+                || (len == 14 && code.equals("UKBasicBankAccountNumber") && id.equals(account3))) {
+            logger.info("Account is Domestic-Unrestricted , Switched and modulus is passed");
+            return Optional.of(new ResponseConfig(AccountStatus.DOMESTIC_UNRESTRICTED, SwitchingStatus.SWITCHED, ModulusCheckStatus.PASS));
+        } else if ((len == 22 && code.equals("InternationalBankAccountNumber") && id.equals(ibanAccount4))
+                || (len == 14 && code.equals("UKBasicBankAccountNumber") && id.equals(account4))) {
+            logger.info("Account is Domestic-Unrestricted , NotSwitching and modulus is failed");
+            return Optional.of(new ResponseConfig(AccountStatus.DOMESTIC_UNRESTRICTED, SwitchingStatus.NOT_SWITCHING, ModulusCheckStatus.FAILED));
+        }
+
+        return Optional.empty();
+    }
+
+    private String extractLast14Digits(String ibanAccount1) {
+        return ibanAccount1 != null && ibanAccount1.length() >=14 ?
+                ibanAccount1.substring(ibanAccount1.length()-14):
+                ibanAccount1;
+    }
+
+    private void applyResponse(Document doc, XPath xpath, ResponseConfig config) throws XPathExpressionException {
+        String transactionId = generateTransactionId();
+        logger.info("Transaction ID: {}", transactionId);
+        logger.info("Account Type",config.status().getValue());
+        logger.info("Switching", config.switching().getValue());
+        logger.info("Modulus", config.modulus().getValue());
+
+
+        set(xpath, doc, "//*[local-name()='transactionId']", transactionId);
+        set(xpath, doc, "//*[local-name()='accountingUnits']/*[local-name()='status']/*[local-name()='codeValue']", config.status().getValue());
+        set(xpath, doc, "//*[local-name()='switchingStatus']/*[local-name()='codeValue']", config.switching().getValue());
+        set(xpath, doc, "//*[local-name()='modulusCheckStatus']/*[local-name()='codeValue']", config.modulus().getValue());
+    }
+
+    private void set(XPath xpath, Document doc, String expr, String value) throws XPathExpressionException {
+        Node node = (Node) xpath.evaluate(expr, doc, XPathConstants.NODE);
+        if (node != null) node.setTextContent(value);
+    }
+
+    private String generateTransactionId() {
+        return "3flS" + UUID.randomUUID().toString().replace("-", "") + "h";
+    }
+
+    private record RequestParams(String identifier, String codeValue, int numberOfDigits) {}
+    private record ResponseConfig(AccountStatus status, SwitchingStatus switching, ModulusCheckStatus modulus) {}
+}
