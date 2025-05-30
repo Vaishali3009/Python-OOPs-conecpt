@@ -1,21 +1,31 @@
-etc.)
+package com.rbs.bdd.exception;
 
-    @Bean
-    public SoapFaultMappingExceptionResolver exceptionResolver() {
-        SoapFaultMappingExceptionResolver resolver = new SoapFaultMappingExceptionResolver();
-        resolver.setOrder(1); // Ensure this has high precedence
+import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.ws.soap.SoapMessageCreationException;
 
-        // Map exceptions to SOAP fault codes
-        Properties errorMappings = new Properties();
-        errorMappings.setProperty(Exception.class.getName(), SoapFaultDefinition.SERVER.toString());
-        resolver.setExceptionMappings(errorMappings);
+import java.io.IOException;
 
-        // Define default SOAP fault
-        SoapFaultDefinition defaultFault = new SoapFaultDefinition();
-        defaultFault.setFaultCode(SoapFaultDefinition.SERVER);
-        defaultFault.setFaultStringOrReason("Internal Error"); // Will appear in <faultstring>
-        resolver.setDefaultFault(defaultFault);
+@ControllerAdvice
+public class GlobalSoapExceptionHandler {
 
-        return resolver;
+    @ExceptionHandler(SoapMessageCreationException.class)
+    public void handleMalformedXml(Exception ex, HttpServletResponse response) throws IOException {
+        response.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+        response.setContentType("text/xml");
+
+        String error = """
+            <env:Envelope xmlns:env="http://schemas.xmlsoap.org/soap/envelope/">
+              <env:Body>
+                <env:Fault>
+                  <faultcode>env:Client</faultcode>
+                  <faultstring>Internal Error</faultstring>
+                </env:Fault>
+              </env:Body>
+            </env:Envelope>
+            """;
+
+        response.getWriter().write(error);
     }
 }
