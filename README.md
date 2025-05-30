@@ -120,7 +120,7 @@ public class SchemaValidationInterceptor extends PayloadValidatingInterceptor {
 
     private Node getNode(Document doc, String localName) {
         NodeList nodes = doc.getElementsByTagNameNS("*", localName);
-        return nodes.getLength() > 0 ? nodes.item(0).getParentNode() : null;
+        return nodes.getLength() > 0 ? nodes.item(0) : null;
     }
 
     private void replaceTextNode(Document doc, String placeholder, String newValue) {
