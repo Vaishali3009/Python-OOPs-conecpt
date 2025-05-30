@@ -1,5 +1,3 @@
-package com.rbs.bdd.infrastructure.config;
-
 import com.rbs.bdd.application.exception.SchemaValidationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
