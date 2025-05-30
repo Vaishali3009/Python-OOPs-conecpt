@@ -1,107 +1,27 @@
-import com.rbs.bdd.common.ServiceConstants;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.ws.context.MessageContext;
-import org.springframework.ws.server.EndpointInterceptor;
-import org.springframework.ws.soap.SoapMessage;
-import org.springframework.ws.soap.saaj.SaajSoapMessage;
-import org.w3c.dom.Document;
-import org.w3c.dom.Node;
+@Override
+public boolean handleRequest(MessageContext messageContext, Object endpoint) throws WebServiceClientException {
+    try {
+        ByteArrayOutputStream reqOut = new ByteArrayOutputStream();
+        messageContext.getRequest().writeTo(reqOut);
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+        factory.setNamespaceAware(true);
+        factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+        DocumentBuilder builder = factory.newDocumentBuilder();
+        builder.parse(new ByteArrayInputStream(reqOut.toByteArray()));
+    } catch (Exception e) {
+        logger.error("Malformed request XML detected. Returning default SOAP Fault.", e);
 
-import javax.xml.XMLConstants;
-import javax.xml.parsers.DocumentBuilder;
-import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.transform.Transformer;
-import javax.xml.transform.TransformerFactory;
-import javax.xml.transform.dom.DOMSource;
-import javax.xml.transform.stream.StreamResult;
-import javax.xml.transform.stream.StreamSource;
-import javax.xml.xpath.XPath;
-import javax.xml.xpath.XPathConstants;
-import javax.xml.xpath.XPathFactory;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
-import java.time.ZonedDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.UUID;
-
-/**
- * Intercepts schema validation failures and replaces the SOAP response with a custom error message.
- */
-public class SchemaValidationInterceptor implements EndpointInterceptor {
-
-    private static final Logger logger = LoggerFactory.getLogger(SchemaValidationInterceptor.class);
-
-    @Override
-    public boolean handleRequest(MessageContext messageContext, Object endpoint) {
-        return true;
-    }
-
-    @Override
-    public boolean handleResponse(MessageContext messageContext, Object endpoint) {
-        return true;
-    }
-
-    @Override
-    public boolean handleFault(MessageContext messageContext, Object endpoint) {
-        logger.warn("Schema validation error detected. Generating custom SOAP fault response...");
-
-        try (InputStream xml = getClass().getClassLoader().getResourceAsStream(ServiceConstants.SCHEMA_VALIDATION_ERROR_XML)) {
-            if (xml == null) {
-                logger.error("schemaValidationError.xml not found in resources");
-                return true;
-            }
-
-            // Parse the static error XML file
-            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-            factory.setNamespaceAware(true);
-            factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
-            DocumentBuilder builder = factory.newDocumentBuilder();
-            Document doc = builder.parse(xml);
-            XPath xpath = XPathFactory.newInstance().newXPath();
-
-            // Update fields using XPath
-            set(xpath, doc, ServiceConstants.XPATH_FAULT_TRANSACTION_ID, generateTransactionId());
-            set(xpath, doc, ServiceConstants.XPATH_FAULT_RESPONSE_ID, generateTransactionId());
-            set(xpath, doc, ServiceConstants.XPATH_FAULT_TIMESTAMP, getCurrentUKTimestamp());
-
-            // Transform updated document to output stream
-            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-            Transformer transformer = TransformerFactory.newInstance().newTransformer();
-            transformer.transform(new DOMSource(doc), new StreamResult(outputStream));
-
-            // Write custom error response
-            SaajSoapMessage response = (SaajSoapMessage) messageContext.getResponse();
-            response.getSaajMessage().getSOAPPart().setContent(
-                    new StreamSource(new ByteArrayInputStream(outputStream.toByteArray()))
-            );
-
-        } catch (Exception e) {
-            logger.error("Error handling schema validation failure: {}", e.getMessage(), e);
+        try {
+            SaajSoapMessage soapResponse = (SaajSoapMessage) messageContext.getResponse();
+            soapResponse.setFault(true);
+            soapResponse.getSoapBody().addClientOrSenderFault("Internal Error", null);
+            messageContext.getResponse().setFault(true); // Ensures HTTP 500
+        } catch (Exception innerEx) {
+            logger.error("Failed to send SOAP Fault.", innerEx);
         }
 
-        return false; // Prevent default fault response
+        return false; // Don't continue the chain
     }
 
-    @Override
-    public void afterCompletion(MessageContext messageContext, Object endpoint, Exception ex) {
-        // No-op
-    }
-
-    private void set(XPath xpath, Document doc, String expr, String value) throws Exception {
-        Node node = (Node) xpath.evaluate(expr, doc, XPathConstants.NODE);
-        if (node != null) {
-            node.setTextContent(value);
-        }
-    }
-
-    private String generateTransactionId() {
-        return "1alN2edd" + UUID.randomUUID().toString().replace("-", "") + "h";
-    }
-
-    private String getCurrentUKTimestamp() {
-        return ZonedDateTime.now(java.time.ZoneId.of("Europe/London"))
-                .format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssXXX"));
-    }
+    return true; // Proceed if valid
 }
