@@ -1,32 +1,21 @@
-import org.springframework.ws.soap.server.endpoint.SoapFaultMappingExceptionResolver;
-import org.springframework.ws.soap.SoapBody;
-import org.springframework.ws.soap.SoapFault;
-import org.springframework.ws.soap.SoapMessage;
+etc.)
 
-import javax.xml.soap.SOAPException;
-import java.util.Properties;
+    @Bean
+    public SoapFaultMappingExceptionResolver exceptionResolver() {
+        SoapFaultMappingExceptionResolver resolver = new SoapFaultMappingExceptionResolver();
+        resolver.setOrder(1); // Ensure this has high precedence
 
-public class CustomSoapFaultResolver extends SoapFaultMappingExceptionResolver {
-
-    public CustomSoapFaultResolver() {
-        super.setOrder(1); // Make sure it takes precedence
+        // Map exceptions to SOAP fault codes
         Properties errorMappings = new Properties();
-        errorMappings.setProperty(Exception.class.getName(), "SERVER");
-        setExceptionMappings(errorMappings);
+        errorMappings.setProperty(Exception.class.getName(), SoapFaultDefinition.SERVER.toString());
+        resolver.setExceptionMappings(errorMappings);
+
+        // Define default SOAP fault
+        SoapFaultDefinition defaultFault = new SoapFaultDefinition();
+        defaultFault.setFaultCode(SoapFaultDefinition.SERVER);
+        defaultFault.setFaultStringOrReason("Internal Error"); // Will appear in <faultstring>
+        resolver.setDefaultFault(defaultFault);
+
+        return resolver;
     }
-
-    @Override
-    protected void customizeFault(Object endpoint, Exception ex, SoapFault fault) {
-        fault.setFaultStringOrReason("Internal Error");
-    }
-}
-
-
-
-
-
-
-@Bean
-public SoapFaultMappingExceptionResolver exceptionResolver() {
-    return new CustomSoapFaultResolver();
 }
