@@ -1,8 +1,6 @@
 package com.rbs.bdd.infrastructure.config;
 
-import com.rbs.bdd.application.exception.SchemaValidationException;
 import com.rbs.bdd.common.ServiceConstants;
-import jakarta.xml.soap.SOAPException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ws.WebServiceMessage;
@@ -16,106 +14,97 @@ import org.xml.sax.SAXParseException;
 import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.transform.Transformer;
-import javax.xml.transform.TransformerFactory;
+import javax.xml.soap.SOAPException;
 import javax.xml.transform.dom.DOMSource;
 import javax.xml.transform.stream.StreamResult;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
-import java.time.ZonedDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.UUID;
+import javax.xml.transform.stream.StreamSource;
 import javax.xml.xpath.XPath;
 import javax.xml.xpath.XPathConstants;
 import javax.xml.xpath.XPathFactory;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.UUID;
 
 /**
- * Custom interceptor that handles schema validation failures and replaces the
- * SOAP response with a static XML error file customized with request ID and timestamp.
+ * Intercepts schema validation failures and replaces the SOAP response with a custom static fault response.
  */
 public class SchemaValidationInterceptor extends PayloadValidatingInterceptor {
 
     private static final Logger logger = LoggerFactory.getLogger(SchemaValidationInterceptor.class);
+    private static final String PLACEHOLDER = "TXN_ID_PLACEHOLDER";
 
     @Override
     protected boolean handleRequestValidationErrors(MessageContext messageContext, SAXParseException[] errors) {
-        logger.warn("Schema validation error detected. Generating custom SOAP fault response.");
+        logger.warn("Schema validation error detected. Generating custom SOAP fault response...");
 
-        try (InputStream xml = getClass().getClassLoader()
-                .getResourceAsStream(ServiceConstants.SCHEMA_VALIDATION_ERROR_XML_PATH)) {
-
+        try (InputStream xml = getClass().getClassLoader().getResourceAsStream("static-response/schemaValidationError.xml")) {
             if (xml == null) {
                 logger.error("schemaValidationError.xml not found in resources");
-                return true; // fallback to default behavior
+                return true;
             }
 
-            // Load and parse static XML
+            // Load static error XML as DOM
             DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
             factory.setNamespaceAware(true);
             factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
             DocumentBuilder builder = factory.newDocumentBuilder();
             Document doc = builder.parse(xml);
 
-            // Modify: refRequestIds > transactionId
+            // Prepare XPath
             XPath xpath = XPathFactory.newInstance().newXPath();
-            Node refTxnIdNode = (Node) xpath.evaluate("//*[local-name()='refRequestIds']/*[local-name()='transactionId']",
-                    doc, XPathConstants.NODE);
-            String incomingTxnId = extractTransactionIdFromRequest(messageContext);
-            if (refTxnIdNode != null && incomingTxnId != null) {
-                refTxnIdNode.setTextContent(incomingTxnId);
+
+            // Extract transactionId from incoming request (XPath to original request's field)
+            WebServiceMessage requestMessage = messageContext.getRequest();
+            ByteArrayOutputStream requestOut = new ByteArrayOutputStream();
+            requestMessage.writeTo(requestOut);
+            Document requestDoc = builder.parse(new ByteArrayInputStream(requestOut.toByteArray()));
+
+            String requestTxnId = xpath.evaluate("//*[local-name()='transactionId']", requestDoc);
+            if (requestTxnId == null || requestTxnId.isBlank()) {
+                requestTxnId = "UNKNOWN_TXN";
             }
 
-            // Modify: responseId > transactionId
-            Node responseTxnIdNode = (Node) xpath.evaluate("//*[local-name()='responseId']/*[local-name()='transactionId']",
-                    doc, XPathConstants.NODE);
-            if (responseTxnIdNode != null) {
-                responseTxnIdNode.setTextContent(generateTransactionId());
-            }
+            // Modify the static XML: update responseId->transactionId, refRequestIds->transactionId, timestamp
+            String generatedTxnId = "1alN" + UUID.randomUUID().toString().replace("-", "").substring(0, 28) + "h";
+            String ukTimestamp = OffsetDateTime.now(ZoneId.of("Europe/London"))
+                    .format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX"));
 
-            // Modify: timestamp
-            Node timestampNode = (Node) xpath.evaluate("//*[local-name()='timestamp']", doc, XPathConstants.NODE);
-            if (timestampNode != null) {
-                timestampNode.setTextContent(getCurrentUKTimestamp());
-            }
+            setNodeText(xpath, doc, "//*[local-name()='responseId']/*[local-name()='transactionId']", generatedTxnId);
+            setNodeText(xpath, doc, "//*[local-name()='refRequestIds']/*[local-name()='transactionId']", requestTxnId);
+            setNodeText(xpath, doc, "//*[local-name()='timestamp']", ukTimestamp);
 
-            // Write modified XML to SOAP response
+            // Write back the modified XML to the response
             ByteArrayOutputStream out = new ByteArrayOutputStream();
-            Transformer transformer = TransformerFactory.newInstance().newTransformer();
-            transformer.transform(new DOMSource(doc), new StreamResult(out));
+            DOMSource domSource = new DOMSource(doc);
+            StreamResult streamResult = new StreamResult(out);
+            javax.xml.transform.TransformerFactory.newInstance().newTransformer().transform(domSource, streamResult);
 
-            WebServiceMessage response = messageContext.getResponse();
-            ((SaajSoapMessage) response).getSaajMessage().getSOAPPart()
-                    .setContent(new javax.xml.transform.stream.StreamSource(new ByteArrayInputStream(out.toByteArray())));
+            SaajSoapMessage saajMessage = (SaajSoapMessage) messageContext.getResponse();
+            saajMessage.getSaajMessage().getSOAPPart().setContent(
+                    new StreamSource(new ByteArrayInputStream(out.toByteArray()))
+            );
 
         } catch (Exception e) {
-            logger.error("Failed to generate custom schema validation fault response", e);
-            throw new SchemaValidationException("Failed to generate schema validation fault", e);
+            logger.error("Failed to handle schema validation error", e);
+            return true; // fallback to default
         }
 
-        return false; // prevent default SOAP Fault
+        return false; // stop further processing
     }
 
-    private String extractTransactionIdFromRequest(MessageContext messageContext) {
-        try {
-            SaajSoapMessage request = (SaajSoapMessage) messageContext.getRequest();
-            Document doc = request.getSaajMessage().getSOAPPart().getEnvelope().getBody();
-            XPath xpath = XPathFactory.newInstance().newXPath();
-            Node txnIdNode = (Node) xpath.evaluate("//*[local-name()='requestIds']/*[local-name()='transactionId']",
-                    doc, XPathConstants.NODE);
-            return txnIdNode != null ? txnIdNode.getTextContent() : null;
-        } catch (Exception e) {
-            logger.error("Could not extract transactionId from request", e);
-            return null;
+    /**
+     * Utility to set node text via XPath.
+     */
+    private void setNodeText(XPath xpath, Document doc, String expression, String value) throws Exception {
+        Node node = (Node) xpath.evaluate(expression, doc, XPathConstants.NODE);
+        if (node != null) {
+            node.setTextContent(value);
+        } else {
+            logger.warn("XPath not found: " + expression);
         }
-    }
-
-    private String generateTransactionId() {
-        return "1alN" + UUID.randomUUID().toString().replace("-", "") + "h";
-    }
-
-    private String getCurrentUKTimestamp() {
-        ZonedDateTime now = ZonedDateTime.now(java.time.ZoneId.of("Europe/London"));
-        return now.format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX"));
     }
 }
