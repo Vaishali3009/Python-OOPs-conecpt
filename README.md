@@ -1,125 +1,77 @@
-package com.rbs.bdd.infrastructure.soap.interceptor;
+@Override
+protected boolean handleRequestValidationErrors(MessageContext messageContext, SAXParseException[] errors) {
+    logger.warn("Schema validation error detected. Generating custom SOAP fault response.");
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.core.io.ClassPathResource;
-import org.springframework.ws.context.MessageContext;
-import org.springframework.ws.server.EndpointInterceptor;
-import org.springframework.ws.soap.SoapMessage;
-import org.springframework.ws.soap.saaj.SaajSoapMessage;
-import org.w3c.dom.Document;
-import org.w3c.dom.Node;
+    try (InputStream xml = getClass().getClassLoader().getResourceAsStream(ServiceConstants.SCHEMA_VALIDATION_ERROR_XML)) {
 
-import javax.xml.XMLConstants;
-import javax.xml.parsers.DocumentBuilder;
-import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.transform.Transformer;
-import javax.xml.transform.TransformerFactory;
-import javax.xml.transform.dom.DOMSource;
-import javax.xml.transform.stream.StreamResult;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.nio.charset.StandardCharsets;
-import java.time.ZonedDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.UUID;
+        if (xml == null) {
+            logger.error("schemaValidationError.xml not found in resources");
+            return true;
+        }
+
+        // Parse static error XML
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+        factory.setNamespaceAware(true);
+        factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+        DocumentBuilder builder = factory.newDocumentBuilder();
+        Document doc = builder.parse(xml);
+
+        // Extract transactionId from request
+        SaajSoapMessage requestMessage = (SaajSoapMessage) messageContext.getRequest();
+        SOAPMessage soapRequest = requestMessage.getSaajMessage();
+        SOAPBody body = soapRequest.getSOAPBody();
+
+        XPath xpath = XPathFactory.newInstance().newXPath();
+        Node transactionIdNode = (Node) xpath.evaluate(
+                "//*[local-name()='requestIds']/*[local-name()='transactionId']",
+                body,
+                XPathConstants.NODE
+        );
+
+        String requestTransactionId = transactionIdNode != null ? transactionIdNode.getTextContent() : "123456789"; // fallback
+        String generatedTxnId = generateTransactionId();
+        String timestamp = ZonedDateTime.now(ZoneId.of("Europe/London"))
+                .format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssXXX"));
+
+        // Set values in error response
+        setNodeValue(doc, "//*[local-name()='refRequestIds']/*[local-name()='transactionId']", requestTransactionId);
+        setNodeValue(doc, "//*[local-name()='responseId']/*[local-name()='transactionId']", generatedTxnId);
+        setNodeValue(doc, "//*[local-name()='cmdNotifications']/*[local-name()='timestamp']", timestamp);
+
+        // Write modified XML back to response
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        TransformerFactory tf = TransformerFactory.newInstance();
+        tf.setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, "");
+        tf.setAttribute(XMLConstants.ACCESS_EXTERNAL_STYLESHEET, "");
+        Transformer transformer = tf.newTransformer();
+        transformer.transform(new DOMSource(doc), new StreamResult(out));
+
+        WebServiceMessage response = messageContext.getResponse();
+        ((SaajSoapMessage) response).getSaajMessage().getSOAPPart()
+                .setContent(new StreamSource(new ByteArrayInputStream(out.toByteArray())));
+
+    } catch (Exception e) {
+        logger.error("Failed to handle schema validation error: {}", e.getMessage(), e);
+        return true;
+    }
+
+    return false; // prevent further processing
+}
 
 /**
- * Interceptor to handle schema validation failures by returning a custom SOAP error response.
+ * Helper method to set value using XPath
  */
-public class SchemaValidationInterceptor implements EndpointInterceptor {
-
-    private static final Logger logger = LoggerFactory.getLogger(SchemaValidationInterceptor.class);
-    private static final String ERROR_XML_PATH = "error-responses/schemaValidationError.xml";
-    private static final String XPATH_TRANSACTION_ID = "//*[local-name()='refRequestIds']/*[local-name()='transactionId']";
-    private static final String XPATH_RESPONSE_ID = "//*[local-name()='responseId']";
-    private static final String XPATH_TIMESTAMP = "//*[local-name()='timestamp']";
-
-    @Override
-    public boolean handleRequest(MessageContext messageContext, Object endpoint) {
-        return true;
-    }
-
-    @Override
-    public boolean handleResponse(MessageContext messageContext, Object endpoint) {
-        return true;
-    }
-
-    @Override
-    public boolean handleFault(MessageContext messageContext, Object endpoint) {
-        try {
-            // Load the static error response XML
-            ClassPathResource resource = new ClassPathResource(ERROR_XML_PATH);
-            byte[] bytes = resource.getInputStream().readAllBytes();
-
-            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-            factory.setNamespaceAware(true);
-            factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
-            DocumentBuilder builder = factory.newDocumentBuilder();
-            Document doc = builder.parse(new ByteArrayInputStream(bytes));
-
-            // Modify the document
-            setNodeValue(doc, XPATH_TRANSACTION_ID, generateTransactionId());
-            setNodeValue(doc, XPATH_RESPONSE_ID, generateTransactionId());
-            setNodeValue(doc, XPATH_TIMESTAMP, getCurrentTimestamp());
-
-            // Convert back to SOAP message
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            Transformer transformer = TransformerFactory.newInstance().newTransformer();
-            transformer.transform(new DOMSource(doc), new StreamResult(out));
-
-            SaajSoapMessage response = (SaajSoapMessage) messageContext.getResponse();
-            response.getSaajMessage().getSOAPPart()
-                    .setContent(new DOMSource(builder.parse(new ByteArrayInputStream(out.toByteArray()))));
-
-        } catch (Exception ex) {
-            logger.error("Error generating custom SOAP fault response: {}", ex.getMessage(), ex);
-        }
-
-        return false; // Stop further processing
-    }
-
-    @Override
-    public void afterCompletion(MessageContext messageContext, Object endpoint, Exception ex) {
-        // No-op
-    }
-
-    /**
-     * Updates a node's text content by XPath.
-     */
-    private void setNodeValue(Document doc, String xpathExpr, String value) throws Exception {
-        Node node = javax.xml.xpath.XPathFactory.newInstance().newXPath()
-                .evaluate(xpathExpr, doc, javax.xml.xpath.XPathConstants.NODE) instanceof Node n ? n : null;
-        if (node != null) {
-            node.setTextContent(value);
-        }
-    }
-
-    /**
-     * Generates a random transaction ID for responseId or transactionId fields.
-     */
-    private String generateTransactionId() {
-        return "1alN2edd" + UUID.randomUUID().toString().replace("-", "") + "h";
-    }
-
-    /**
-     * Gets the current timestamp in UK time zone with required format.
-     */
-    private String getCurrentTimestamp() {
-        return ZonedDateTime.now(java.time.ZoneId.of("Europe/London"))
-                .format(DateTimeFormatter.ISO_OFFSET_DATE_TIME);
+private void setNodeValue(Document doc, String expression, String value) throws XPathExpressionException {
+    XPath xpath = XPathFactory.newInstance().newXPath();
+    Node node = (Node) xpath.evaluate(expression, doc, XPathConstants.NODE);
+    if (node != null) {
+        node.setTextContent(value);
     }
 }
 
-
-
-
-------
-public class ServiceConstants {
-    public static final String SCHEMA_VALIDATION_ERROR_XML = "error-response/schemaValidationError.xml";
-
-    public static final String XPATH_FAULT_TRANSACTION_ID = "//*[local-name()='refRequestIds']/*[local-name()='transactionId']";
-    public static final String XPATH_FAULT_RESPONSE_ID = "//*[local-name()='responseId']";
-    public static final String XPATH_FAULT_TIMESTAMP = "//*[local-name()='timestamp']";
+/**
+ * Helper method to generate random transaction ID
+ */
+private String generateTransactionId() {
+    return "1alN" + UUID.randomUUID().toString().replaceAll("-", "").substring(0, 28) + "h";
 }
-
