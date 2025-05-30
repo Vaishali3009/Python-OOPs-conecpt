@@ -3,24 +3,28 @@ public boolean handleRequest(MessageContext messageContext, Object endpoint) thr
     try {
         ByteArrayOutputStream reqOut = new ByteArrayOutputStream();
         messageContext.getRequest().writeTo(reqOut);
+
         DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
         factory.setNamespaceAware(true);
         factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
         DocumentBuilder builder = factory.newDocumentBuilder();
-        builder.parse(new ByteArrayInputStream(reqOut.toByteArray()));
+        builder.parse(new ByteArrayInputStream(reqOut.toByteArray())); // Throws exception if malformed
     } catch (Exception e) {
-        logger.error("Malformed request XML detected. Returning default SOAP Fault.", e);
+        logger.error("Malformed XML detected. Returning SOAP Fault...");
 
         try {
             SaajSoapMessage soapResponse = (SaajSoapMessage) messageContext.getResponse();
-            soapResponse.setFault(true);
-            soapResponse.getSoapBody().addClientOrSenderFault("Internal Error", null);
-            messageContext.getResponse().setFault(true); // Ensures HTTP 500
+            soapResponse.getSaajMessage()
+                        .getSOAPBody()
+                        .addFault(
+                            soapResponse.getSaajMessage().getSOAPPart().getEnvelope().createName("Client", "env", "http://schemas.xmlsoap.org/soap/envelope/"),
+                            "Internal Error"
+                        );
         } catch (Exception innerEx) {
-            logger.error("Failed to send SOAP Fault.", innerEx);
+            logger.error("Error writing SOAP fault for malformed XML", innerEx);
         }
 
-        return false; // Don't continue the chain
+        return false; // Block further processing and return 500
     }
 
     return true; // Proceed if valid
