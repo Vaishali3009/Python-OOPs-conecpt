@@ -1,7 +1,6 @@
 package com.rbs.bdd.infrastructure.config;
 
 import com.rbs.bdd.application.exception.SchemaValidationException;
-import com.rbs.bdd.common.ServiceConstants;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ws.WebServiceMessage;
@@ -30,132 +29,127 @@ import java.io.InputStream;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.UUID;
 
 /**
- * Intercepts schema validation errors and returns custom SOAP response from static XML.
+ * Intercepts schema validation failures and replaces the SOAP response with a custom static XML response.
  */
 public class SchemaValidationInterceptor extends PayloadValidatingInterceptor {
 
     private static final Logger logger = LoggerFactory.getLogger(SchemaValidationInterceptor.class);
+    private static final String PLACEHOLDER_TXN = "TXN_ID_PLACEHOLDER";
+    private static final String PLACEHOLDER_RESPONSE = "RESPONSE_ID_PLACEHOLDER";
 
     @Override
-    protected boolean handleRequestValidationErrors(MessageContext messageContext, SAXParseException[] errors) {
-        logger.warn("Schema validation error detected. Generating custom SOAP fault response...");
+    public boolean handleValidationErrors(MessageContext messageContext, SAXParseException[] errors) {
+        logger.warn("Schema validation error detected. Replacing response using static schemaValidationError.xml");
 
-        try (InputStream xml = getClass().getClassLoader().getResourceAsStream("static-response/schemaValidationError.xml")) {
-            if (xml == null) {
-                logger.error("schemaValidationError.xml not found in resources");
-                return true; // fallback to default behavior
+        try (InputStream staticXml = getClass().getClassLoader()
+                .getResourceAsStream("static-response/schemaValidationError.xml")) {
+
+            if (staticXml == null) {
+                logger.error("Static schema validation error file not found in resources.");
+                return true; // fallback to default Spring fault
             }
 
-            // Parse static XML
             DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
             factory.setNamespaceAware(true);
             factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
             DocumentBuilder builder = factory.newDocumentBuilder();
-            Document doc = builder.parse(xml);
 
-            // Parse request
+            // Load error response
+            Document doc = builder.parse(staticXml);
+
+            // Load original request
             WebServiceMessage request = messageContext.getRequest();
-            Document requestDoc = builder.parse(new ByteArrayInputStream(toByteArray(request)));
+            ByteArrayOutputStream reqOut = new ByteArrayOutputStream();
+            request.writeTo(reqOut);
+            Document requestDoc = builder.parse(new ByteArrayInputStream(reqOut.toByteArray()));
 
-            String requestTxnId = getNodeValue(requestDoc, "transactionId");
-            String requestSystemId = getNodeValue(requestDoc, "systemId");
+            String requestTxnId = getValueFromRequest(requestDoc, "transactionId");
+            String requestSystemId = getValueFromRequest(requestDoc, "systemId");
 
-            // refRequestIds logic
+            // Update placeholders in response
+            replaceTextNode(doc, PLACEHOLDER_RESPONSE, generateTxnId());
+            replaceTextNode(doc, PLACEHOLDER_TXN, requestTxnId != null ? requestTxnId : PLACEHOLDER_TXN);
+
+            // Handle optional requestId tags
             Node refRequestIdsNode = getNode(doc, "refRequestIds");
-            if (refRequestIdsNode != null) {
-                if (requestTxnId != null) {
-                    updateOrRemoveChild(refRequestIdsNode, "transactionId", requestTxnId);
-                } else {
-                    removeChild(refRequestIdsNode, "transactionId");
-                }
 
-                if (requestSystemId != null) {
-                    updateOrRemoveChild(refRequestIdsNode, "systemId", requestSystemId);
-                } else {
-                    removeChild(refRequestIdsNode, "systemId");
-                }
+            if (refRequestIdsNode != null) {
+                if (requestTxnId == null) removeNode(refRequestIdsNode, "transactionId");
+                if (requestSystemId == null) removeNode(refRequestIdsNode, "systemId");
 
                 if (!refRequestIdsNode.hasChildNodes()) {
                     refRequestIdsNode.getParentNode().removeChild(refRequestIdsNode);
                 }
             }
 
-            // Set timestamp
-            String timestamp = OffsetDateTime.now(ZoneId.of("Europe/London"))
+            // Update timestamp
+            String ukTime = OffsetDateTime.now(ZoneId.of("Europe/London"))
                     .format(DateTimeFormatter.ISO_OFFSET_DATE_TIME);
-            setNodeValue(doc, "cmdNotifications/timestamp", timestamp);
+            setXPathValue(doc, "//*[local-name()='timestamp']", ukTime);
 
-            // Transform DOM to SOAP
+            // Write final response
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             Transformer transformer = TransformerFactory.newInstance().newTransformer();
             transformer.transform(new DOMSource(doc), new StreamResult(out));
 
-            SaajSoapMessage saajResponse = (SaajSoapMessage) messageContext.getResponse();
-            saajResponse.getSaajMessage().getSOAPPart()
+            SaajSoapMessage soapResponse = (SaajSoapMessage) messageContext.getResponse();
+            soapResponse.getSaajMessage().getSOAPPart()
                     .setContent(new StreamSource(new ByteArrayInputStream(out.toByteArray())));
 
         } catch (Exception e) {
-            logger.error("Error generating custom schema validation fault", e);
-            throw new SchemaValidationException("Failed to generate schema error response", e);
+            logger.error("Error creating custom schema validation response", e);
+            throw new SchemaValidationException("Failed to generate custom schema validation response", e);
         }
 
-        return false; // prevent default Spring fault
+        return false; // prevent default SOAP fault
     }
 
-    // Convert WebServiceMessage to byte[]
-    private byte[] toByteArray(WebServiceMessage message) throws Exception {
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        message.writeTo(baos);
-        return baos.toByteArray();
+    private String generateTxnId() {
+        return "1alN" + UUID.randomUUID().toString().replace("-", "") + "h";
     }
 
-    // Get node by local name
+    private String getValueFromRequest(Document doc, String tag) {
+        NodeList list = doc.getElementsByTagNameNS("*", tag);
+        return list.getLength() > 0 ? list.item(0).getTextContent() : null;
+    }
+
     private Node getNode(Document doc, String localName) {
         NodeList nodes = doc.getElementsByTagNameNS("*", localName);
         return nodes.getLength() > 0 ? nodes.item(0).getParentNode() : null;
     }
 
-    // Get value of node
-    private String getNodeValue(Document doc, String localName) {
-        NodeList nodes = doc.getElementsByTagNameNS("*", localName);
-        return nodes.getLength() > 0 ? nodes.item(0).getTextContent() : null;
-    }
-
-    // Set or update text content
-    private void setNodeValue(Document doc, String path, String value) throws Exception {
-        XPath xpath = XPathFactory.newInstance().newXPath();
-        Node node = (Node) xpath.evaluate("//*[local-name()='" + path.replace("/", "']/*[local-name()='") + "']",
-                doc, XPathConstants.NODE);
-        if (node != null) {
-            node.setTextContent(value);
-        }
-    }
-
-    // Update or add child
-    private void updateOrRemoveChild(Node parent, String tagName, String value) {
-        NodeList children = parent.getChildNodes();
-        for (int i = 0; i < children.getLength(); i++) {
-            Node child = children.item(i);
-            if (child.getLocalName() != null && child.getLocalName().equals(tagName)) {
-                child.setTextContent(value);
-                return;
+    private void replaceTextNode(Document doc, String placeholder, String newValue) {
+        NodeList nodes = doc.getElementsByTagNameNS("*", "transactionId");
+        for (int i = 0; i < nodes.getLength(); i++) {
+            Node txn = nodes.item(i);
+            if (placeholder.equals(txn.getTextContent())) {
+                txn.setTextContent(newValue);
             }
         }
 
-        // If tag not found, add new
-        Node newChild = parent.getOwnerDocument().createElementNS(parent.getNamespaceURI(), tagName);
-        newChild.setTextContent(value);
-        parent.appendChild(newChild);
+        NodeList responseNodes = doc.getElementsByTagNameNS("*", "transactionId");
+        for (int i = 0; i < responseNodes.getLength(); i++) {
+            Node txn = responseNodes.item(i);
+            if (placeholder.equals(txn.getTextContent())) {
+                txn.setTextContent(newValue);
+            }
+        }
     }
 
-    // Remove child node
-    private void removeChild(Node parent, String tagName) {
+    private void setXPathValue(Document doc, String path, String value) throws Exception {
+        XPath xpath = XPathFactory.newInstance().newXPath();
+        Node node = (Node) xpath.evaluate(path, doc, XPathConstants.NODE);
+        if (node != null) node.setTextContent(value);
+    }
+
+    private void removeNode(Node parent, String tagName) {
         NodeList children = parent.getChildNodes();
         for (int i = 0; i < children.getLength(); i++) {
             Node child = children.item(i);
-            if (child.getLocalName() != null && child.getLocalName().equals(tagName)) {
+            if (tagName.equals(child.getLocalName())) {
                 parent.removeChild(child);
                 break;
             }
