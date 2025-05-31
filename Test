@@ -1,31 +1,205 @@
-@Override
-public boolean handleRequest(MessageContext messageContext, Object endpoint) throws WebServiceClientException {
-    try {
-        ByteArrayOutputStream reqOut = new ByteArrayOutputStream();
-        messageContext.getRequest().writeTo(reqOut);
+import com.rbs.bdd.infrastructure.soap.resolver.MalformedXmlExceptionResolver;
 
-        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-        factory.setNamespaceAware(true);
-        factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
-        DocumentBuilder builder = factory.newDocumentBuilder();
-        builder.parse(new ByteArrayInputStream(reqOut.toByteArray())); // Throws exception if malformed
-    } catch (Exception e) {
-        logger.error("Malformed XML detected. Returning SOAP Fault...");
+@Bean
+public SoapFaultMappingExceptionResolver exceptionResolver() {
+    MalformedXmlExceptionResolver resolver = new MalformedXmlExceptionResolver();
+    resolver.setOrder(0); // High priority to catch malformed XML
+    return resolver;
+}
 
-        try {
-            SaajSoapMessage soapResponse = (SaajSoapMessage) messageContext.getResponse();
-            soapResponse.getSaajMessage()
-                        .getSOAPBody()
-                        .addFault(
-                            soapResponse.getSaajMessage().getSOAPPart().getEnvelope().createName("Client", "env", "http://schemas.xmlsoap.org/soap/envelope/"),
-                            "Internal Error"
-                        );
-        } catch (Exception innerEx) {
-            logger.error("Error writing SOAP fault for malformed XML", innerEx);
+
+------
+package com.rbs.bdd.infrastructure.soap.resolver;
+
+import jakarta.xml.transform.stream.StreamSource;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.ws.context.MessageContext;
+import org.springframework.ws.soap.server.endpoint.SoapFaultMappingExceptionResolver;
+import org.springframework.ws.soap.saaj.SaajSoapMessage;
+
+import javax.xml.transform.TransformerFactory;
+import javax.xml.transform.stream.StreamResult;
+import java.io.InputStream;
+
+public class MalformedXmlExceptionResolver extends SoapFaultMappingExceptionResolver {
+
+    private static final String MALFORMED_XML_PATH = "static-response/malformed-error.xml";
+
+    @Override
+    protected boolean resolveExceptionInternal(MessageContext messageContext, Object endpoint, Exception ex) {
+        logger.warn("Malformed XML detected. Returning static SOAP error.");
+
+        try (InputStream errorXml = new ClassPathResource(MALFORMED_XML_PATH).getInputStream()) {
+            SaajSoapMessage response = (SaajSoapMessage) messageContext.getResponse();
+
+            // Replace entire SOAP body with static error
+            TransformerFactory.newInstance().newTransformer().transform(
+                    new StreamSource(errorXml),
+                    new StreamResult(response.getSaajMessage().getSOAPPart().getContent())
+            );
+
+            // Override HTTP status to 500
+            response.setSoapAction("Internal Error");
+            response.getSoapBody().getFault().setFaultString("Internal Error");
+            messageContext.getResponse().setFault(true);
+        } catch (Exception e) {
+            logger.error("Failed to return static SOAP error for malformed XML", e);
         }
 
-        return false; // Block further processing and return 500
+        return true; // Prevent default processing
+    }
+}
+
+----/
+
+
+package com.rbs.bdd.infrastructure.soap.interceptor;
+
+import com.rbs.bdd.application.exception.SchemaValidationException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.ws.WebServiceMessage;
+import org.springframework.ws.context.MessageContext;
+import org.springframework.ws.soap.saaj.SaajSoapMessage;
+import org.springframework.ws.soap.server.endpoint.interceptor.PayloadValidatingInterceptor;
+import org.w3c.dom.Document;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
+import org.xml.sax.SAXParseException;
+
+import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.transform.Transformer;
+import javax.xml.transform.TransformerFactory;
+import javax.xml.transform.dom.DOMSource;
+import javax.xml.transform.stream.StreamResult;
+import javax.xml.transform.stream.StreamSource;
+import javax.xml.xpath.XPath;
+import javax.xml.xpath.XPathConstants;
+import javax.xml.xpath.XPathFactory;
+import javax.xml.soap.SOAPMessage;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.UUID;
+
+import static com.rbs.bdd.common.ServiceConstants.SCHEMA_VALIDATION_ERROR_XML;
+
+/**
+ * Handles schema validation errors and returns a custom SOAP response with HTTP 500.
+ */
+public class SchemaValidationInterceptor extends PayloadValidatingInterceptor {
+
+    private static final Logger logger = LoggerFactory.getLogger(SchemaValidationInterceptor.class);
+    private static final String PLACEHOLDER_TXN = "TXN_ID_PLACEHOLDER";
+    private static final String PLACEHOLDER_RESPONSE = "RESPONSE_ID_PLACEHOLDER";
+
+    @Override
+    public boolean handleRequestValidationErrors(MessageContext messageContext, SAXParseException[] errors) {
+        logger.warn("Schema validation error. Returning custom response with HTTP 500");
+
+        try (InputStream staticXml = getClass().getClassLoader().getResourceAsStream(SCHEMA_VALIDATION_ERROR_XML)) {
+
+            if (staticXml == null) {
+                logger.error("schemaValidationError.xml not found in resources.");
+                return true;
+            }
+
+            // Parse static XML response
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+            factory.setNamespaceAware(true);
+            factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+            DocumentBuilder builder = factory.newDocumentBuilder();
+            Document doc = builder.parse(staticXml);
+
+            // Parse original request
+            WebServiceMessage request = messageContext.getRequest();
+            ByteArrayOutputStream requestBytes = new ByteArrayOutputStream();
+            request.writeTo(requestBytes);
+            Document requestDoc = builder.parse(new ByteArrayInputStream(requestBytes.toByteArray()));
+
+            String txnId = getValueFromRequest(requestDoc, "transactionId");
+            String systemId = getValueFromRequest(requestDoc, "systemId");
+
+            // Replace placeholders in static response
+            replaceTextNode(doc, PLACEHOLDER_RESPONSE, generateTxnId());
+            replaceTextNode(doc, PLACEHOLDER_TXN, txnId != null ? txnId : PLACEHOLDER_TXN);
+            setXPathValue(doc, "//*[local-name()='timestamp']", OffsetDateTime.now(ZoneId.of("Europe/London"))
+                    .format(DateTimeFormatter.ISO_OFFSET_DATE_TIME));
+
+            // Remove conditional nodes
+            Node refRequestIds = getNode(doc, "refRequestIds");
+            if (refRequestIds != null) {
+                if (txnId == null) removeNode(refRequestIds, "transactionId");
+                if (systemId == null) removeNode(refRequestIds, "systemId");
+                if (!refRequestIds.hasChildNodes()) refRequestIds.getParentNode().removeChild(refRequestIds);
+            }
+
+            // Write back modified SOAP response
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            Transformer transformer = TransformerFactory.newInstance().newTransformer();
+            transformer.transform(new DOMSource(doc), new StreamResult(out));
+
+            SaajSoapMessage response = (SaajSoapMessage) messageContext.getResponse();
+            SOAPMessage soapMessage = response.getSaajMessage();
+            soapMessage.getSOAPPart().setContent(new StreamSource(new ByteArrayInputStream(out.toByteArray())));
+
+            // ⛔️ Set HTTP 500 explicitly
+            response.setFault(true);  // this sets HTTP 500 status code internally
+
+        } catch (Exception e) {
+            logger.error("Error in schema validation fault handling", e);
+            throw new SchemaValidationException("Failed to handle schema validation fault", e);
+        }
+
+        return false; // prevent default Spring SOAP fault
     }
 
-    return true; // Proceed if valid
+    private String generateTxnId() {
+        return "1alN" + UUID.randomUUID().toString().replace("-", "") + "h";
+    }
+
+    private String getValueFromRequest(Document doc, String tag) {
+        NodeList list = doc.getElementsByTagNameNS("*", tag);
+        return list.getLength() > 0 ? list.item(0).getTextContent() : null;
+    }
+
+    private Node getNode(Document doc, String localName) {
+        NodeList nodes = doc.getElementsByTagNameNS("*", localName);
+        return nodes.getLength() > 0 ? nodes.item(0) : null;
+    }
+
+    private void replaceTextNode(Document doc, String placeholder, String newValue) {
+        NodeList nodes = doc.getElementsByTagNameNS("*", "transactionId");
+        for (int i = 0; i < nodes.getLength(); i++) {
+            Node txn = nodes.item(i);
+            if (placeholder.equals(txn.getTextContent())) {
+                txn.setTextContent(newValue);
+            }
+        }
+    }
+
+    private void setXPathValue(Document doc, String path, String value) throws Exception {
+        XPath xpath = XPathFactory.newInstance().newXPath();
+        Node node = (Node) xpath.evaluate(path, doc, XPathConstants.NODE);
+        if (node != null) node.setTextContent(value);
+    }
+
+    private void removeNode(Node parent, String tagName) {
+        NodeList children = parent.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++) {
+            Node child = children.item(i);
+            if (tagName.equals(child.getLocalName())) {
+                parent.removeChild(child);
+                break;
+            }
+        }
+    }
 }
+
+
+
